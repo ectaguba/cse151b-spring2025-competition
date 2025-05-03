@@ -1,0 +1,7 @@
+# @package _global_.model
+type: unet_res              # ← maps to UNetRes
+
+# --- U‑Net hyper‑params ---
+init_dim: 64                # feature channels in first level
+depth: 4                    # encoder/decoder depth (levels)
+dropout_rate: 0.2

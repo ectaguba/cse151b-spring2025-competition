@@ -514,6 +514,84 @@ class ClimateEmulationModule(pl.LightningModule):
         optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
         return optimizer
 
+# --- Temporal Versions ---
+# ----------------------------------------------------------------------
+# Helper: turn a 4‑D ClimateDataset into a temporal window on‑the‑fly
+# ----------------------------------------------------------------------
+class WindowWrapperDataset(torch.utils.data.Dataset):
+    """Wrap an *existing* ClimateDataset so __getitem__ returns [T,C,H,W]."""
+    def __init__(self, base_ds: ClimateDataset, window: int = 3):
+        self.base   = base_ds
+        self.window = window
+
+    def __len__(self):
+        return len(self.base)
+
+    @staticmethod
+    def _indices(idx, k):
+        left = max(0, idx - k + 1)
+        seq  = list(range(left, idx + 1))
+        while len(seq) < k:
+            seq.insert(0, seq[0])
+        return seq[-k:]
+
+    def __getitem__(self, idx):
+        if self.window == 1:
+            x, y = self.base[idx]            # x:[C,H,W]
+            return x.unsqueeze(0), y         # → [1,C,H,W]
+        seq = self._indices(idx, self.window)
+        frames = [self.base[i][0] for i in seq]   # collect frames
+        _, y   = self.base[idx]                   # target only at idx
+        x = torch.stack(frames, dim=0)            # [T,C,H,W]
+        return x, y
+
+# ---------------------------------------------------------------------
+# Temporal variants  (keep originals unchanged)
+# ---------------------------------------------------------------------
+class TemporalClimateDataset(ClimateDataset):
+    r"""Return a temporal window shaped [T, C, H, W] instead of [C, H, W]."""
+    def __init__(self, *args, window_length: int = 3, **kw):
+        super().__init__(*args, **kw)
+        self.window_length = window_length
+
+    # helper: indices for [t‑(k‑1), …, t] with left‑padding
+    @staticmethod
+    def _window(idx, k):
+        left = max(0, idx - k + 1)
+        seq  = list(range(left, idx + 1))
+        while len(seq) < k:
+            seq.insert(0, seq[0])
+        return seq[-k:]
+
+    def __getitem__(self, idx):
+        if self.window_length == 1:
+            x, y = super().__getitem__(idx)      # original [C,H,W]
+            return x.unsqueeze(0), y             # -> [1,C,H,W]
+        seq = self._window(idx, self.window_length)
+        frames = [super().__getitem__(i)[0] for i in seq]   # list of [C,H,W]
+        # (targets only from centre idx)
+        _, y = super().__getitem__(idx)
+        x = torch.stack(frames, dim=0)           # [T,C,H,W]
+        return x, y
+
+
+class TemporalClimateEmulationDataModule(ClimateEmulationDataModule):
+    """Re‑uses parent setup() then wraps datasets in WindowWrapperDataset."""
+    def __init__(self, *args, window_length: int = 3, **kw):
+        super().__init__(*args, **kw)
+        self.window_length = window_length
+
+    def setup(self, stage=None):
+        super().setup(stage)  # builds self.train/val/test_dataset (4‑D)
+
+        # Wrap each dataset so it yields temporal windows
+        self.train_dataset = WindowWrapperDataset(self.train_dataset,
+                                                  window=self.window_length)
+        self.val_dataset   = WindowWrapperDataset(self.val_dataset,
+                                                  window=self.window_length)
+        self.test_dataset  = WindowWrapperDataset(self.test_dataset,
+                                                  window=self.window_length)
+
 
 # --- Main Execution with Hydra ---
 @hydra.main(version_base=None, config_path="configs", config_name="main_config.yaml")
@@ -525,7 +603,17 @@ def main(cfg: DictConfig):
     pl.seed_everything(cfg.seed, workers=True)
 
     # Create data module with parameters from configs
-    datamodule = ClimateEmulationDataModule(seed=cfg.seed, **cfg.data)
+    # datamodule = ClimateEmulationDataModule(seed=cfg.seed, **cfg.data)
+    temporal_models = {"temporal_cnn", "temporal_unet_dilated"}
+    
+    dm_kwargs   = dict(cfg.data) # convert ΩConf to plain dict
+    win_length  = dm_kwargs.pop("window_length", 1)
+    
+    DMClass = TemporalClimateEmulationDataModule if cfg.model.type in temporal_models \
+             else ClimateEmulationDataModule
+    
+    datamodule = DMClass(seed=cfg.seed, window_length=win_length, **dm_kwargs)
+
     model = get_model(cfg)
 
     # Create lightning module

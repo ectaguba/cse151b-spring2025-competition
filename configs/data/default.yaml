@@ -24,3 +24,5 @@ test_months: 360
 
 batch_size: 32
 num_workers: 4
+
+window_length: 3 # months to feed into the temporal models (≥1)
