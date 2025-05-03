@@ -155,12 +155,18 @@ class TemporalCNN(nn.Module):
         super().__init__()
         self.depth = depth
         # First layer shared for all timesteps
-        self.encoder = nn.Conv2d(n_input_channels, hidden_channels, 3, padding=1)
+        self.encoder = nn.Sequential(
+            nn.Conv2d(n_input_channels, hidden_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1),
+            nn.ReLU(inplace=True),
+        )
         # ConvLSTM stack
         self.lstm_cells = nn.ModuleList(
             [ConvLSTMCell(hidden_channels, hidden_channels) for _ in range(depth)]
         )
         self.dropout = nn.Dropout2d(dropout_rate)
+        self.se = SEBlock(hidden_channels)
         self.head    = nn.Conv2d(hidden_channels, n_output_channels, 1)
 
     def forward(self, x):
@@ -178,7 +184,7 @@ class TemporalCNN(nn.Module):
                     c = [torch.zeros_like(feat) for _ in range(self.depth)]
                 h[i], c[i] = cell(feat if i == 0 else h[i-1], h[i], c[i])
             # final h[-1] is memory after this timestep
-        out = self.dropout(h[-1])
+        out = self.dropout(self.se(h[-1]))
         return self.head(out)
 
 

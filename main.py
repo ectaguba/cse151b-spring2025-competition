@@ -512,8 +512,16 @@ class ClimateEmulationModule(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
+        if self.hparams.get("scheduler", None) == "cosine":
+             print("Using cosine LR")
+             sched = optim.lr_scheduler.CosineAnnealingLR(
+                 optimizer,
+                 T_max=self.hparams.scheduler_params.T_max,
+                 eta_min=self.hparams.scheduler_params.eta_min,
+             )
+             return [optimizer], [sched]
         return optimizer
-
+        
 # --- Temporal Versions ---
 # ----------------------------------------------------------------------
 # Helper: turn a 4‑D ClimateDataset into a temporal window on‑the‑fly
@@ -604,8 +612,9 @@ def main(cfg: DictConfig):
 
     # Create data module with parameters from configs
     # datamodule = ClimateEmulationDataModule(seed=cfg.seed, **cfg.data)
+
+    # TO-DO: Fix unexpected keyword window_length when using SimpleCNN
     temporal_models = {"temporal_cnn", "temporal_unet_dilated"}
-    
     dm_kwargs   = dict(cfg.data) # convert ΩConf to plain dict
     win_length  = dm_kwargs.pop("window_length", 1)
     
@@ -629,6 +638,10 @@ def main(cfg: DictConfig):
     # Train model
     trainer.fit(lightning_module, datamodule=datamodule, ckpt_path=cfg.ckpt_path)
     log.info("Training finished.")
+
+    # Log all checkpoints as W&B artifacts  ⬇⬇⬇
+    if cfg.use_wandb and isinstance(trainer_config.get("logger"), WandbLogger):
+        trainer.logger.experiment.save("checkpoints/**/*.ckpt")
 
     # Test model
     # IMPORTANT: Please note that the test metrics will be bad because the test targets have been corrupted on the public Kaggle dataset.

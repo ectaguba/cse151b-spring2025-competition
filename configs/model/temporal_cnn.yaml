@@ -2,8 +2,8 @@
 type: temporal_cnn          # ← maps to TemporalCNN
 
 # --- architecture hyper‑params ---
-hidden_channels: 64         # channels inside ConvLSTM / feature extractor
-depth: 3                    # number of stacked ConvLSTM cells
-dropout_rate: 0.2
+hidden_channels: 128         # channels inside ConvLSTM / feature extractor
+depth: 2                     # number of stacked ConvLSTM cells
+dropout_rate: 0.0
 
 # (Nothing to set for kernel_size etc.; TemporalCNN fixes its own 3×3 convs.)
