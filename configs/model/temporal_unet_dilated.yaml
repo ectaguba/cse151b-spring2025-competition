@@ -2,12 +2,12 @@
 type: temporal_unet_dilated   # ← maps to TemporalUNetDilated
 
 # --- temporal front‑end ---
-time_hidden: 64              # channels in ConvLSTM hidden state
+time_hidden: 512             # channels in ConvLSTM hidden state
 
 # --- U‑Net path ---
-unet_init: 64                # first encoder level channels
-depth: 4                     # encoder/decoder depth
+unet_init: 128               # first encoder level channels
+depth: 4                     # encoder/decoder depth (for some reason changing depth from 4 to 6 messes it up??
 dilation: 2                  # dilation factor used in dilated blocks
 
 # --- regularization ---
-dropout_rate: 0.2
+dropout_rate: 0.0

@@ -151,7 +151,9 @@ class TemporalCNN(nn.Module):
                  n_output_channels: int,
                  hidden_channels: int = 64,
                  depth: int = 3,
-                 dropout_rate: float = 0.2):
+                 dropout_rate: float = 0.2, 
+                 bottleneck: bool = True,
+                 pool_k: int = 2):
         super().__init__()
         self.depth = depth
         # First layer shared for all timesteps
@@ -168,6 +170,11 @@ class TemporalCNN(nn.Module):
         self.dropout = nn.Dropout2d(dropout_rate)
         self.se = SEBlock(hidden_channels)
         self.head    = nn.Conv2d(hidden_channels, n_output_channels, 1)
+        self.bottleneck = bottleneck
+        if bottleneck:
+            self.pool  = nn.AvgPool2d(pool_k)          # 48×72 → 24×36
+            self.unpool = nn.Upsample(scale_factor=pool_k,
+                                      mode="bilinear", align_corners=False)
 
     def forward(self, x):
         # x: [B,T,C,H,W]  -> iterate over time
@@ -176,7 +183,10 @@ class TemporalCNN(nn.Module):
         B, T, C, H, W = x.shape
         h = c = None
         for t in range(T):
-            feat = torch.relu(self.encoder(x[:, t]))
+            # feat = torch.relu(self.encoder(x[:, t]))
+            feat = self.encoder(x[:, t])
+            if self.bottleneck:
+                feat = self.pool(feat)
             # propagate through stacked ConvLSTM cells
             for i, cell in enumerate(self.lstm_cells):
                 if h is None:
@@ -184,7 +194,10 @@ class TemporalCNN(nn.Module):
                     c = [torch.zeros_like(feat) for _ in range(self.depth)]
                 h[i], c[i] = cell(feat if i == 0 else h[i-1], h[i], c[i])
             # final h[-1] is memory after this timestep
-        out = self.dropout(self.se(h[-1]))
+        feat = h[-1]                              # last hidden state
+        if self.bottleneck:
+            feat = self.unpool(feat)              # back to 48×72
+        out = self.dropout(self.se(feat))
         return self.head(out)
 
 
@@ -280,92 +293,197 @@ class DilatedResNet(nn.Module):
         x = self.dropout(x)
         return self.head(x)
 
-# ----------------------------------------------------------------------
-# 4. ConvLSTM + Dilated‑Residual U‑Net (“temporal_unet_dilated”)
-# ----------------------------------------------------------------------
-
+# ---------------------------------------------------------------------
+# 4. ConvLSTM + Dilated U‑Net
+# ---------------------------------------------------------------------
 class DilatedResidualBlock(nn.Module):
-    """Residual block with selectable dilation."""
     def __init__(self, in_c, out_c, k=3, dilation=1):
         super().__init__()
-        pad = dilation * (k // 2)
-        self.conv1 = nn.Conv2d(in_c, out_c, k, padding=pad, dilation=dilation)
+        p = dilation * (k // 2)
+        self.conv1 = nn.Conv2d(in_c, out_c, k, padding=p, dilation=dilation)
         self.bn1   = nn.BatchNorm2d(out_c)
-        self.relu  = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(out_c, out_c, k, padding=pad, dilation=dilation)
+        self.relu  = nn.ReLU(True)
+        self.conv2 = nn.Conv2d(out_c, out_c, k, padding=p, dilation=dilation)
         self.bn2   = nn.BatchNorm2d(out_c)
-
-        self.skip = nn.Sequential()
-        if in_c != out_c:
-            self.skip = nn.Sequential(nn.Conv2d(in_c, out_c, 1), nn.BatchNorm2d(out_c))
+        self.skip  = nn.Identity() if in_c == out_c else \
+                     nn.Sequential(nn.Conv2d(in_c, out_c, 1), nn.BatchNorm2d(out_c))
 
     def forward(self, x):
         y = self.relu(self.bn1(self.conv1(x)))
         y = self.bn2(self.conv2(y))
-        y += self.skip(x)
-        return self.relu(y)
+        return self.relu(y + self.skip(x))
 
 
 class TemporalUNetDilated(nn.Module):
-    """
-    Input  : [B, T, C_in, H, W]   (T = temporal window length)
-    Output : [B,   C_out, H, W]
-    """
+    r"""[B,T,C,H,W] → [B,C_out,H,W]"""
     def __init__(self,
-                 n_input_channels: int,
-                 n_output_channels: int,
-                 time_hidden: int = 64,
-                 unet_init: int   = 64,
-                 depth: int       = 4,
-                 dilation: int    = 2,
-                 dropout_rate: float = 0.2):
+                 n_input_channels,
+                 n_output_channels,
+                 time_hidden=128,
+                 unet_init=64,
+                 depth=4,
+                 dilation=2,
+                 dropout_rate=0.2,
+                 bottleneck=True,
+                 pool_k=2):
         super().__init__()
-
-        # --- Temporal front‑end -------------------------------------------------
+        # temporal front‑end
         self.enc2d = nn.Conv2d(n_input_channels, time_hidden, 3, padding=1)
         self.lstm  = ConvLSTMCell(time_hidden, time_hidden)
-
-        # --- U‑Net with dilated residual blocks --------------------------------
-        self.downs, self.ups, feats = nn.ModuleList(), nn.ModuleList(), []
-        in_c = time_hidden
+        # optional spatial bottleneck inside LSTM
+        self.bottleneck_flag = bottleneck
+        if bottleneck:
+            self.pool2d = nn.AvgPool2d(pool_k)
+            self.up2d   = nn.Upsample(scale_factor=pool_k,
+                                      mode="bilinear", align_corners=False)
+        # U‑Net with dilated residual blocks
+        downs, ups, feats = nn.ModuleList(), nn.ModuleList(), []
+        c = time_hidden
         for d in range(depth):
             out_c = unet_init * 2 ** d
-            self.downs.append(DilatedResidualBlock(in_c, out_c,
-                                                   dilation=1 if d % 2 == 0 else dilation))
+            downs.append(DilatedResidualBlock(c, out_c,
+                                              dilation=1 if d % 2 == 0 else dilation))
             feats.append(out_c)
-            in_c = out_c
-        self.pool = nn.MaxPool2d(2, 2)
-        self.bottleneck = DilatedResidualBlock(in_c, in_c * 2, dilation=dilation)
-
+            c = out_c
+        self.downs = downs
+        self.pool  = nn.MaxPool2d(2)
+        self.bottleneck = DilatedResidualBlock(c, c * 2, dilation=dilation)
+        c = c * 2
         for d in reversed(range(depth)):
-            self.ups.append(UpBlock(in_c * 2, feats[d]))
-            in_c = feats[d]
-
+            ups.append(UpBlock(c, feats[d]))
+            c = feats[d]
+        self.ups = ups
         self.dropout = nn.Dropout2d(dropout_rate)
-        self.final   = nn.Conv2d(in_c, n_output_channels, 1)
+        self.final   = nn.Conv2d(c, n_output_channels, 1)
 
     def forward(self, x):
-        if x.ndim == 4: # accidental [B,C,H,W]
-            x = x.unsqueeze(1) # → [B,1,C,H,W]
-        # --------------- ConvLSTM over the temporal dimension -------------------
+        if x.ndim == 4:
+            x = x.unsqueeze(1)
         B, T, C, H, W = x.shape
-        h = c = torch.zeros(B, self.enc2d.out_channels, H, W, device=x.device)
+        h = c = None                                      # start empty
         for t in range(T):
-            z   = torch.relu(self.enc2d(x[:, t]))
+            z = torch.relu(self.enc2d(x[:, t]))
+            if self.bottleneck_flag:                      # pooled to 24×36
+                z = self.pool2d(z)
+            if h is None:
+                h = torch.zeros_like(z)
+                c = torch.zeros_like(z)
+            elif h.shape[-2:] != z.shape[-2:]:
+                # e.g. if z is 24×36 but h is 12×18, resize h,c to z’s spatial dims
+                h = nn.functional.interpolate(h, size=z.shape[-2:], mode="nearest")
+                c = nn.functional.interpolate(c, size=z.shape[-2:], mode="nearest")
             h, c = self.lstm(z, h, c)
-        x = h                                # shape [B, time_hidden, H, W]
-
-        # --------------------------- U‑Net path ---------------------------------
+        x = h
+        if self.bottleneck_flag:
+            x = self.up2d(x)
         skips = []
         for down in self.downs:
             x = down(x)
             skips.append(x)
             x = self.pool(x)
-
         x = self.bottleneck(x)
-
         for up, sk in zip(self.ups, reversed(skips)):
             x = up(x, sk)
-
         x = self.dropout(x)
         return self.final(x)
+
+# ---------------------------------------------------------------------
+# 5. Spatio-Temporal Transformer (STTransformer)
+# ---------------------------------------------------------------------
+        
+
+# class TemporalTransformer(nn.Module):
+#     """
+#     Spatio-temporal attention (token-per-gridcell) in place of ConvLSTM.
+#     Inputs:  x [B, T, C_in, H, W]
+#     Outputs:   [B, C_out,    H, W]
+#     """
+#     def __init__(
+#         self,
+#         n_input_channels:  int,
+#         n_output_channels: int,
+#         hidden_channels:   int = 128,   # d_model
+#         num_layers:        int = 4,
+#         num_heads:         int = 8,
+#         dropout_rate:      float = 0.1,
+#         bottleneck:        bool  = True,
+#         pool_k:            int   = 2,
+#         max_window:        int   = 512,  # max T for pos-embeddings
+#     ):
+#         super().__init__()
+#         assert hidden_channels % num_heads == 0, "hidden_channels must be divisible by num_heads"
+
+#         # 1) per-timestep spatial encoder
+#         self.spatial_encoder = nn.Sequential(
+#             nn.Conv2d(n_input_channels, hidden_channels, 3, padding=1),
+#             nn.ReLU(inplace=True),
+#             nn.Conv2d(hidden_channels, hidden_channels, 3, padding=1),
+#             nn.ReLU(inplace=True),
+#         )
+#         self.bottleneck = bottleneck
+#         if bottleneck:
+#             self.pool   = nn.AvgPool2d(pool_k)   # ↓ spatial (e.g. 48×72 → 24×36)
+#             self.unpool = nn.Upsample(
+#                 scale_factor=pool_k, mode="bilinear", align_corners=False
+#             )
+
+#         # 2) temporal transformer encoder
+#         encoder_layer = nn.TransformerEncoderLayer(
+#             d_model          = hidden_channels,
+#             nhead            = num_heads,
+#             dim_feedforward  = hidden_channels * 4,
+#             dropout          = dropout_rate,
+#             norm_first       = True,
+#             batch_first      = True,    # expects (B·S, T, E)
+#         )
+#         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+
+#         # 3) learnable temporal positional embeddings [max_window, E]
+#         self.time_pe = nn.Parameter(torch.randn(max_window, hidden_channels))
+
+#         # 4) output head
+#         self.dropout = nn.Dropout2d(dropout_rate)
+#         self.se      = SEBlock(hidden_channels)
+#         self.head    = nn.Conv2d(hidden_channels, n_output_channels, 1)
+
+#     def forward(self, x):
+#         # handle accidental 4-D input
+#         if x.ndim == 4:           # [B,C,H,W]
+#             x = x.unsqueeze(1)     # → [B,1,C,H,W]
+
+#         B, T, C, H, W = x.shape
+
+#         # 1) encode each timestep spatially
+#         frames = []
+#         for t in range(T):
+#             f = self.spatial_encoder(x[:, t])    # [B, E, H', W']
+#             if self.bottleneck:
+#                 f = self.pool(f)                  # ↓ spatial
+#             frames.append(f)
+
+#         # 2) stack time and flatten space → (B·S, T, E)
+#         #    where S = H'·W'
+#         feats = torch.stack(frames, dim=1)       # [B, T, E, H', W']
+#         _, _, E, Hp, Wp = feats.shape
+#         S = Hp * Wp
+
+#         # bring spatial to batch-axis, time to seq-axis
+#         feats = feats.permute(0, 3, 4, 1, 2).contiguous()  # [B, H', W', T, E]
+#         feats = feats.view(B * S, T, E)                    # [B·S, T, E]
+
+#         # 3) add temporal pos-emb
+#         pe = self.time_pe[:T]                              # [T, E]
+#         feats = feats + pe.unsqueeze(0)                    # broadcast to [B·S, T, E]
+
+#         # 4) run transformer, take last timestep
+#         feats = self.transformer(feats)                    # [B·S, T, E]
+#         feats = feats[:, -1]                               # [B·S, E]
+
+#         # 5) reshape back to spatial map
+#         feats = feats.view(B, Hp, Wp, E).permute(0, 3, 1, 2)  # [B, E, H', W']
+#         if self.bottleneck:
+#             feats = self.unpool(feats)                      # ↑ spatial
+
+#         # 6) final head
+#         out = self.head(self.dropout(self.se(feats)))      # [B, C_out, H, W]
+#         return out

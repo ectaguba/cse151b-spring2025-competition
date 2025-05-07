@@ -3,5 +3,5 @@
 lr: 5e-4
 scheduler: cosine
 scheduler_params:
-  T_max: 60               # length of the cosine cycle (same as epochs)
-  eta_min: 1e-5           # final LR
+    T_max: 60
+    eta_min: 1e-5

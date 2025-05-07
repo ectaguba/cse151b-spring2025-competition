@@ -138,6 +138,7 @@ class ClimateEmulationDataModule(LightningDataModule):
         train_ssps: list,
         test_ssp: str,
         target_member_id: int,
+        member_ids: list = None,
         test_months: int = 360,
         batch_size: int = 32,
         eval_batch_size: int = None,
@@ -152,6 +153,10 @@ class ClimateEmulationDataModule(LightningDataModule):
         # Set evaluation batch size to training batch size if not specified
         if eval_batch_size is None:
             self.hparams.eval_batch_size = batch_size
+
+        # Use one member id ensemble if no list is given
+        if self.hparams.member_ids is None:
+            self.hparams.member_ids = [self.hparams.target_member_id]
 
         # Placeholders
         self.train_dataset, self.val_dataset, self.test_dataset = None, None, None
@@ -177,35 +182,49 @@ class ClimateEmulationDataModule(LightningDataModule):
             val_ssp = "ssp370"
             val_months = 120
 
-            # Process all SSPs
-            log.info(f"Loading data from SSPs: {self.hparams.train_ssps}")
+            val_input_list, val_output_list = [], []
             for ssp in self.hparams.train_ssps:
-                # Load the data for this SSP
-                ssp_input_dask, ssp_output_dask = _load_process_ssp_data(
-                    ds,
-                    ssp,
-                    self.hparams.input_vars,
-                    self.hparams.output_vars,
-                    self.hparams.target_member_id,
-                    spatial_template_da,
-                )
+                for member in self.hparams.member_ids:
+                    log.info(f"Loading ssp: '{ssp}' from member_id '{}'")
+                    # Load this SSP × member
+                    ssp_in, ssp_out = _load_process_ssp_data(
+                        ds,
+                        ssp,
+                        self.hparams.input_vars,
+                        self.hparams.output_vars,
+                        member,
+                        spatial_template_da,
+                    )
+            
+                    if ssp == val_ssp:
+                        # last val_months go to validation
+                        val_input_list.append(ssp_in[-val_months:])
+                        val_output_list.append(ssp_out[-val_months:])
+                        # the earlier months still train
+                        train_inputs_dask_list .append(ssp_in[:-val_months])
+                        train_outputs_dask_list.append(ssp_out[:-val_months])
+                    else:
+                        # all months of non-validation SSP×member train
+                        train_inputs_dask_list .append(ssp_in)
+                        train_outputs_dask_list.append(ssp_out)
 
-                if ssp == val_ssp:
-                    # Special handling for SSP 370: split into training and validation
-                    # Last 120 months go to validation
-                    val_input_dask = ssp_input_dask[-val_months:]
-                    val_output_dask = ssp_output_dask[-val_months:]
-                    # Early months go to training if there are any
-                    train_inputs_dask_list.append(ssp_input_dask[:-val_months])
-                    train_outputs_dask_list.append(ssp_output_dask[:-val_months])
-                else:
-                    # All other SSPs go entirely to training
-                    train_inputs_dask_list.append(ssp_input_dask)
-                    train_outputs_dask_list.append(ssp_output_dask)
-
+            val_input_dask  = da.concatenate(val_input_list, axis=0)
+            val_output_dask = da.concatenate(val_output_list, axis=0)
+                        
             # Concatenate training data only
             train_input_dask = da.concatenate(train_inputs_dask_list, axis=0)
             train_output_dask = da.concatenate(train_outputs_dask_list, axis=0)
+
+            # Perform log-transform on precipitation to reduce skew
+            if "pr" in self.hparams.output_vars:
+                pr_idx = self.hparams.output_vars.index("pr")
+                pr_arr = train_output_dask[:, pr_idx:pr_idx+1, ...]
+                pr_log = da.log1p(pr_arr)
+                train_output_dask = da.concatenate([
+                    train_output_dask[:, :pr_idx, ...],
+                    pr_log,
+                    train_output_dask[:, pr_idx+1:, ...]
+                ], axis=1)
 
             # Compute z-score normalization statistics using the training data
             input_mean = da.nanmean(train_input_dask, axis=(0, 2, 3), keepdims=True).compute()
@@ -222,6 +241,16 @@ class ClimateEmulationDataModule(LightningDataModule):
 
             # --- Define Normalized Validation Dask Arrays ---
             val_input_norm_dask = self.normalizer.normalize(val_input_dask, data_type="input")
+            # Perform log-transform on validation precipitation too
+            if "pr" in self.hparams.output_vars:
+                pr_idx = self.hparams.output_vars.index("pr")
+                pr_arr = val_output_dask[:, pr_idx:pr_idx+1, ...]
+                pr_log = da.log1p(pr_arr)
+                val_output_dask = da.concatenate([
+                    val_output_dask[:, :pr_idx, ...],
+                    pr_log,
+                    val_output_dask[:, pr_idx+1:, ...]
+                ], axis=1)
             val_output_norm_dask = self.normalizer.normalize(val_output_dask, data_type="output")
 
             # --- Prepare Test Data ---
@@ -614,7 +643,7 @@ def main(cfg: DictConfig):
     # datamodule = ClimateEmulationDataModule(seed=cfg.seed, **cfg.data)
 
     # TO-DO: Fix unexpected keyword window_length when using SimpleCNN
-    temporal_models = {"temporal_cnn", "temporal_unet_dilated"}
+    temporal_models = {"temporal_cnn", "temporal_unet_dilated", "transformer"}
     dm_kwargs   = dict(cfg.data) # convert ΩConf to plain dict
     win_length  = dm_kwargs.pop("window_length", 1)
     

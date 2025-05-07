@@ -17,7 +17,9 @@ wandb_entity: ectaguba-ucsd
 run_name: null
 
 # Path to a checkpoint to load. If set, will load this checkpoint and resume training (evaluation)
-ckpt_path: /home/ctaguba/private/cse151b-spring2025-competition/outputs/2025-05-03/20-29-56/checkpoints/last.ckpt
+ckpt_path: null
+
+# Temporal CNN v4: /home/ctaguba/private/cse151b-spring2025-competition/outputs/2025-05-03/20-29-56/checkpoints/last.ckpt
 
 hydra:
   job:
