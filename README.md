@@ -1,3 +1,10 @@
+# TODO
+- Improve ConvLSTM architecture
+- Experiment w/ decision tree, random forest, and XGBoost
+- Data preparation
+    - Transform skewed distribution of precipitation output
+    - We are already using all `ssp` instances in `main.py`
+    - Find a way to use all three ensemble `member_id`s (simulations)
 # CSE 151B Competition Spring 2025 - Climate Emulation
 
 This repository contains a starting point for the [CSE 151B](https://sites.google.com/view/cse151b-251b/151b-info) competition on climate emulation.
