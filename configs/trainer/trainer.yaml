@@ -5,7 +5,7 @@ accelerator: gpu  # Will be auto-detected in code
 devices: auto  # Will be auto-detected in code
 deterministic: true
 num_sanity_val_steps: 0
-precision: 32
+precision: 16-mixed
 
 # Define callbacks as a list for Hydra instantiation
 callbacks:

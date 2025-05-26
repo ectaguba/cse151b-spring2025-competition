@@ -15,7 +15,8 @@ from lightning.pytorch import LightningDataModule
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
-
+from sklearn.preprocessing import PowerTransformer
+from dask.array import coarsen
 
 try:
     import wandb  # Optional, for logging to Weights & Biases
@@ -170,23 +171,34 @@ class ClimateEmulationDataModule(LightningDataModule):
     def setup(self, stage: str | None = None):
         log.info(f"Setting up data module for stage: {stage} from {self.hparams.path}")
 
-        # Use context manager for opening dataset
         with xr.open_zarr(self.hparams.path, consolidated=True, chunks={"time": 24}) as ds:
-            # Create a spatial template ONCE using a variable guaranteed to have y, x
-            # Extract the template DataArray before renaming for coordinate access
-            spatial_template_da = ds["rsdt"].isel(time=0, ssp=0, drop=True)  # drop time/ssp dims
+            log.info(f"data_vars: {list(ds.data_vars.keys())}")
 
-            # --- Prepare Training and Validation Data ---
+            # Create spatial template
+            spatial_template_da = ds["rsdt"].isel(time=0, ssp=0, drop=True)
+            ny, nx = spatial_template_da.shape
+
+            # --- (1) Month encoding (sin/cos) ---
+            month_vals = ds["time"].dt.month.data                    # (T,)
+            angles    = 2 * np.pi * (month_vals - 1) / 12
+            base_sin  = da.from_array(np.sin(angles)[:,None,None,None],
+                                     chunks=(24,1,1,1))
+            base_cos  = da.from_array(np.cos(angles)[:,None,None,None],
+                                     chunks=(24,1,1,1))
+            ones      = da.ones((1,1,ny,nx), chunks=(1,1,ny,nx))
+            sin_da    = base_sin * ones                              # (T,1,ny,nx)
+            cos_da    = base_cos * ones
+
+            # --- Prepare Training & Validation splits ---
             train_inputs_dask_list, train_outputs_dask_list = [], []
-            val_input_dask, val_output_dask = None, None
-            val_ssp = "ssp370"
-            val_months = 120
-
+            train_sin_list, train_cos_list = [], []
+            val_ssp, val_months = "ssp370", 120
             val_input_list, val_output_list = [], []
+            val_sin_list, val_cos_list = [], []
+
             for ssp in self.hparams.train_ssps:
                 for member in self.hparams.member_ids:
-                    log.info(f"Loading ssp: '{ssp}' from member_id '{}'")
-                    # Load this SSP × member
+                    log.info(f"Loading ssp: '{ssp}' from member_id '{member}'")
                     ssp_in, ssp_out = _load_process_ssp_data(
                         ds,
                         ssp,
@@ -195,65 +207,110 @@ class ClimateEmulationDataModule(LightningDataModule):
                         member,
                         spatial_template_da,
                     )
-            
+
+                    # --- (2) Derived features: Δ & ∑ channels ---
+                    # Δt = x[t] - x[t-1], padded at t=0
+                    delta = da.concatenate(
+                        [ssp_in[0:1], ssp_in[1:] - ssp_in[:-1]],
+                        axis=0
+                    )
+                    # cumulative sum over time
+                    cumsum = da.cumsum(ssp_in, axis=0)
+                    # append them as extra channels
+                    ssp_in = da.concatenate([ssp_in, delta, cumsum], axis=1)
+
                     if ssp == val_ssp:
-                        # last val_months go to validation
+                        # validation portion
                         val_input_list.append(ssp_in[-val_months:])
+                        val_sin_list.append(sin_da[-val_months:])
+                        val_cos_list.append(cos_da[-val_months:])
                         val_output_list.append(ssp_out[-val_months:])
-                        # the earlier months still train
-                        train_inputs_dask_list .append(ssp_in[:-val_months])
+                        # train portion
+                        train_inputs_dask_list.append(ssp_in[:-val_months])
+                        train_sin_list.append(sin_da[:-val_months])
+                        train_cos_list.append(cos_da[:-val_months])
                         train_outputs_dask_list.append(ssp_out[:-val_months])
                     else:
-                        # all months of non-validation SSP×member train
-                        train_inputs_dask_list .append(ssp_in)
+                        train_inputs_dask_list.append(ssp_in)
+                        train_sin_list.append(sin_da)
+                        train_cos_list.append(cos_da)
                         train_outputs_dask_list.append(ssp_out)
 
-            val_input_dask  = da.concatenate(val_input_list, axis=0)
+            # Concatenate val arrays
+            val_input_dask = da.concatenate(val_input_list, axis=0)
+            val_sin_dask   = da.concatenate(val_sin_list,   axis=0)
+            val_cos_dask   = da.concatenate(val_cos_list,   axis=0)
+            val_input_dask = da.concatenate(
+                [val_input_dask, val_sin_dask, val_cos_dask], axis=1
+            )
             val_output_dask = da.concatenate(val_output_list, axis=0)
-                        
-            # Concatenate training data only
-            train_input_dask = da.concatenate(train_inputs_dask_list, axis=0)
+
+            # Concatenate train arrays
+            train_input_dask  = da.concatenate(train_inputs_dask_list, axis=0)
+            train_sin_dask    = da.concatenate(train_sin_list,         axis=0)
+            train_cos_dask    = da.concatenate(train_cos_list,         axis=0)
+            train_input_dask  = da.concatenate(
+                [train_input_dask, train_sin_dask, train_cos_dask], axis=1
+            )
             train_output_dask = da.concatenate(train_outputs_dask_list, axis=0)
 
-            # Perform log-transform on precipitation to reduce skew
-            if "pr" in self.hparams.output_vars:
-                pr_idx = self.hparams.output_vars.index("pr")
-                pr_arr = train_output_dask[:, pr_idx:pr_idx+1, ...]
-                pr_log = da.log1p(pr_arr)
-                train_output_dask = da.concatenate([
-                    train_output_dask[:, :pr_idx, ...],
-                    pr_log,
-                    train_output_dask[:, pr_idx+1:, ...]
-                ], axis=1)
+            # (3) log-transform or power-transform on pr as before
+            # if "pr" in self.hparams.output_vars:
+            #     pr_idx = self.hparams.output_vars.index("pr")
+            #     pr_arr = train_output_dask[:, pr_idx:pr_idx+1, ...]
+            #     pr_log = da.log1p(pr_arr)
+            #     train_output_dask = da.concatenate([
+            #         train_output_dask[:, :pr_idx, ...],
+            #         pr_log,
+            #         train_output_dask[:, pr_idx+1:, ...]
+            #     ], axis=1)
+            train_output_dask = da.log1p(train_output_dask)
 
-            # Compute z-score normalization statistics using the training data
-            input_mean = da.nanmean(train_input_dask, axis=(0, 2, 3), keepdims=True).compute()
-            input_std = da.nanstd(train_input_dask, axis=(0, 2, 3), keepdims=True).compute()
-            output_mean = da.nanmean(train_output_dask, axis=(0, 2, 3), keepdims=True).compute()
-            output_std = da.nanstd(train_output_dask, axis=(0, 2, 3), keepdims=True).compute()
 
-            self.normalizer.set_input_statistics(mean=input_mean, std=input_std)
+            # # --- (4) Spatial Smoothing / Multi-scale inputs ---
+            # # block-average to half-res, then upsample back
+            # coarse = coarsen(np.mean, train_input_dask, {2:2, 3:2}, trim_excess=True)
+            # # now coarse shape = (T, C*, ny//2, nx//2)
+            # coarse_up = coarse.repeat(2, axis=2).repeat(2, axis=3)
+            # train_input_dask = da.concatenate([train_input_dask, coarse_up], axis=1)
+
+            # coarse_val = coarsen(np.mean, val_input_dask, {2:2, 3:2}, trim_excess=True)
+            # coarse_val_up = coarse_val.repeat(2, axis=2).repeat(2, axis=3)
+            # val_input_dask = da.concatenate([val_input_dask, coarse_val_up], axis=1)
+
+            # --- (5) Per-grid-cell robust scaling of inputs ---
+            # compute median & IQR **per cell** (axis=0 only)
+            arr_np = train_input_dask.compute()  # shape (T, C*, y, x)
+            med_cell = np.nanmedian(arr_np, axis=0, keepdims=True)            # (1, C*, y, x)
+            q1_cell  = np.nanpercentile(arr_np, 25, axis=0, keepdims=True)
+            q3_cell  = np.nanpercentile(arr_np, 75, axis=0, keepdims=True)
+            iqr_cell = np.where((q3_cell - q1_cell) > 0, q3_cell - q1_cell, 1.0)
+            self.normalizer.set_input_statistics(mean=med_cell, std=iqr_cell)
+
+            # Standard z-score for outputs
+            output_mean = da.nanmean(train_output_dask, axis=(0,2,3), keepdims=True).compute()
+            output_std  = da.nanstd (train_output_dask, axis=(0,2,3), keepdims=True).compute()
             self.normalizer.set_output_statistics(mean=output_mean, std=output_std)
 
-            # --- Define Normalized Training Dask Arrays ---
-            train_input_norm_dask = self.normalizer.normalize(train_input_dask, data_type="input")
+            # Normalize train & val
+            train_input_norm_dask  = self.normalizer.normalize(train_input_dask,  data_type="input")
             train_output_norm_dask = self.normalizer.normalize(train_output_dask, data_type="output")
+            val_input_norm_dask    = self.normalizer.normalize(val_input_dask,    data_type="input")
 
-            # --- Define Normalized Validation Dask Arrays ---
-            val_input_norm_dask = self.normalizer.normalize(val_input_dask, data_type="input")
-            # Perform log-transform on validation precipitation too
-            if "pr" in self.hparams.output_vars:
-                pr_idx = self.hparams.output_vars.index("pr")
-                pr_arr = val_output_dask[:, pr_idx:pr_idx+1, ...]
-                pr_log = da.log1p(pr_arr)
-                val_output_dask = da.concatenate([
-                    val_output_dask[:, :pr_idx, ...],
-                    pr_log,
-                    val_output_dask[:, pr_idx+1:, ...]
-                ], axis=1)
+            # apply same pr‐transform to val outputs
+            # if "pr" in self.hparams.output_vars:
+            #     pr_idx = self.hparams.output_vars.index("pr")
+            #     pr_arr = val_output_dask[:, pr_idx:pr_idx+1, ...]
+            #     pr_log = da.log1p(pr_arr)
+            #     val_output_dask = da.concatenate([
+            #         val_output_dask[:, :pr_idx, ...],
+            #         pr_log,
+            #         val_output_dask[:, pr_idx+1:, ...]
+            #     ], axis=1)
+            val_output_dask = da.log1p(val_output_dask)
             val_output_norm_dask = self.normalizer.normalize(val_output_dask, data_type="output")
-
-            # --- Prepare Test Data ---
+            
+            # --- Prepare Test Data & apply SAME pipeline ---
             full_test_input_dask, full_test_output_dask = _load_process_ssp_data(
                 ds,
                 self.hparams.test_ssp,
@@ -262,26 +319,48 @@ class ClimateEmulationDataModule(LightningDataModule):
                 self.hparams.target_member_id,
                 spatial_template_da,
             )
+            test_slice = slice(-self.hparams.test_months, None)
+            test_in  = full_test_input_dask[test_slice]
+            test_out = full_test_output_dask[test_slice]
 
-            # --- Slice Test Data ---
-            test_slice = slice(-self.hparams.test_months, None)  # Last N months
+            # derived features on test
+            delta_t = da.concatenate([test_in[0:1], test_in[1:] - test_in[:-1]], axis=0)
+            csum_t  = da.cumsum(test_in, axis=0)
+            test_in = da.concatenate([test_in, delta_t, csum_t], axis=1)
+            
+            # sin/cos
+            sin_t = sin_da[test_slice]; cos_t = cos_da[test_slice]
+            test_in = da.concatenate([test_in, sin_t, cos_t], axis=1)
+            
+            # # spatial smoothing
+            # coarse_t = coarsen(np.mean, test_in, {2:2, 3:2}, trim_excess=True)
+            # test_in = da.concatenate([test_in, coarse_t.repeat(2,2).repeat(2,3)], axis=1)
+            
+            # normalize
+            test_input_norm_dask = self.normalizer.normalize(test_in, data_type="input")
+            # pr log-transform on test
+            # if "pr" in self.hparams.output_vars:
+            #     pr_idx = self.hparams.output_vars.index("pr")
+            #     pr_arr_t = test_out[:, pr_idx:pr_idx+1, ...]
+            #     pr_log_t = da.log1p(pr_arr_t)
+            #     test_out = da.concatenate([
+            #         test_out[:, :pr_idx, ...],
+            #         pr_log_t,
+            #         test_out[:, pr_idx+1:, ...]
+            #     ], axis=1)
+            # test_output_raw_dask = test_out
+            test_output_raw_dask = da.log1p(test_out)
 
-            sliced_test_input_dask = full_test_input_dask[test_slice]
-            sliced_test_output_raw_dask = full_test_output_dask[test_slice]
-
-            # --- Define Normalized Test Input Dask Array ---
-            test_input_norm_dask = self.normalizer.normalize(sliced_test_input_dask, data_type="input")
-            test_output_raw_dask = sliced_test_output_raw_dask  # Keep unnormed for evaluation
-
+            
         # Create datasets
-        self.train_dataset = ClimateDataset(train_input_norm_dask, train_output_norm_dask, output_is_normalized=True)
-        self.val_dataset = ClimateDataset(val_input_norm_dask, val_output_norm_dask, output_is_normalized=True)
-        self.test_dataset = ClimateDataset(test_input_norm_dask, test_output_raw_dask, output_is_normalized=False)
+        self.train_dataset = ClimateDataset(train_input_norm_dask,  train_output_norm_dask, output_is_normalized=True)
+        self.val_dataset   = ClimateDataset(val_input_norm_dask,    val_output_norm_dask,   output_is_normalized=True)
+        self.test_dataset  = ClimateDataset(test_input_norm_dask,   test_output_raw_dask,   output_is_normalized=False)
 
-        # Log dataset sizes in a single message
         log.info(
             f"Datasets created. Train: {len(self.train_dataset)}, Val: {len(self.val_dataset)} (last months of {val_ssp}), Test: {len(self.test_dataset)}"
         )
+
 
     # Common DataLoader configuration
     def _get_dataloader_kwargs(self, is_train=False):
@@ -336,7 +415,6 @@ class ClimateEmulationDataModule(LightningDataModule):
                 self.lon_coords = template.x.values
 
         return self.lat_coords, self.lon_coords
-
 
 # --- PyTorch Lightning Module ---
 class ClimateEmulationModule(pl.LightningModule):
@@ -643,7 +721,7 @@ def main(cfg: DictConfig):
     # datamodule = ClimateEmulationDataModule(seed=cfg.seed, **cfg.data)
 
     # TO-DO: Fix unexpected keyword window_length when using SimpleCNN
-    temporal_models = {"temporal_cnn", "temporal_unet_dilated", "transformer"}
+    temporal_models = {"temporal_cnn"}
     dm_kwargs   = dict(cfg.data) # convert ΩConf to plain dict
     win_length  = dm_kwargs.pop("window_length", 1)
     
