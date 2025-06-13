@@ -2,7 +2,7 @@
 
 defaults:
   - data: data
-  - model: temporal_cnn
+  - model: swin_lstm
   - training: training
   - trainer: trainer
   - _self_

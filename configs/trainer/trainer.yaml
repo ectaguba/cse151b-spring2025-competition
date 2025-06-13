@@ -1,9 +1,9 @@
 # @package _global_.trainer
 
-max_epochs: 60 # Specific number of epochs
+max_epochs: 20 # Specific number of epochs
 accelerator: gpu  # Will be auto-detected in code
 devices: auto  # Will be auto-detected in code
-deterministic: true
+deterministic: false
 num_sanity_val_steps: 0
 precision: 16-mixed
 

@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 import xarray as xr
 from hydra.utils import to_absolute_path
@@ -17,6 +18,8 @@ from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader, Dataset
 from sklearn.preprocessing import PowerTransformer
 from dask.array import coarsen
+
+torch.set_float32_matmul_precision('medium') 
 
 try:
     import wandb  # Optional, for logging to Weights & Biases
@@ -145,21 +148,29 @@ class ClimateEmulationDataModule(LightningDataModule):
         eval_batch_size: int = None,
         num_workers: int = 0,
         seed: int = 42,
+        # new flags
+        pr_transform: bool = False,
+        month_encoding: bool = False,
+        derived_features: bool = False,
+        spatial_smoothing: bool = False,
+        robust_scaling: bool = False,
     ):
         super().__init__()
         self.save_hyperparameters()
         self.hparams.path = to_absolute_path(path)
-        self.normalizer = Normalizer()
+        # flags
+        self.pr_transform     = pr_transform
+        self.month_encoding   = month_encoding
+        self.derived_features = derived_features
+        self.spatial_smoothing = spatial_smoothing
+        self.robust_scaling   = robust_scaling
+        self.normalizer       = Normalizer()
 
-        # Set evaluation batch size to training batch size if not specified
         if eval_batch_size is None:
             self.hparams.eval_batch_size = batch_size
-
-        # Use one member id ensemble if no list is given
         if self.hparams.member_ids is None:
             self.hparams.member_ids = [self.hparams.target_member_id]
 
-        # Placeholders
         self.train_dataset, self.val_dataset, self.test_dataset = None, None, None
         self.lat_coords, self.lon_coords, self._lat_weights_da = None, None, None
 
@@ -171,25 +182,32 @@ class ClimateEmulationDataModule(LightningDataModule):
     def setup(self, stage: str | None = None):
         log.info(f"Setting up data module for stage: {stage} from {self.hparams.path}")
 
-        with xr.open_zarr(self.hparams.path, consolidated=True, chunks={"time": 24}) as ds:
+        with xr.open_zarr(
+            self.hparams.path,
+            consolidated=True,
+            chunks={"time": 24},
+        ) as ds:
             log.info(f"data_vars: {list(ds.data_vars.keys())}")
 
-            # Create spatial template
+            # spatial template
             spatial_template_da = ds["rsdt"].isel(time=0, ssp=0, drop=True)
             ny, nx = spatial_template_da.shape
 
-            # --- (1) Month encoding (sin/cos) ---
-            month_vals = ds["time"].dt.month.data                    # (T,)
-            angles    = 2 * np.pi * (month_vals - 1) / 12
-            base_sin  = da.from_array(np.sin(angles)[:,None,None,None],
-                                     chunks=(24,1,1,1))
-            base_cos  = da.from_array(np.cos(angles)[:,None,None,None],
-                                     chunks=(24,1,1,1))
-            ones      = da.ones((1,1,ny,nx), chunks=(1,1,ny,nx))
-            sin_da    = base_sin * ones                              # (T,1,ny,nx)
-            cos_da    = base_cos * ones
+            # --- Month encoding ---
+            if self.month_encoding:
+                month_vals = ds["time"].dt.month.data  # (T,)
+                angles    = 2 * np.pi * (month_vals - 1) / 12
+                base_sin  = da.from_array(np.sin(angles)[:,None,None,None], chunks=(24,1,1,1))
+                base_cos  = da.from_array(np.cos(angles)[:,None,None,None], chunks=(24,1,1,1))
+                ones      = da.ones((1,1,ny,nx), chunks=(1,1,ny,nx))
+                sin_da    = base_sin * ones  # (T,1,ny,nx)
+                cos_da    = base_cos * ones
+                log.info("Applied month sine/cosine encoding.")
+            else:
+                log.info("Skipping month encoding.")
+                sin_da = cos_da = None
 
-            # --- Prepare Training & Validation splits ---
+            # prepare lists
             train_inputs_dask_list, train_outputs_dask_list = [], []
             train_sin_list, train_cos_list = [], []
             val_ssp, val_months = "ssp370", 120
@@ -208,158 +226,140 @@ class ClimateEmulationDataModule(LightningDataModule):
                         spatial_template_da,
                     )
 
-                    # --- (2) Derived features: Δ & ∑ channels ---
-                    # Δt = x[t] - x[t-1], padded at t=0
-                    delta = da.concatenate(
-                        [ssp_in[0:1], ssp_in[1:] - ssp_in[:-1]],
-                        axis=0
-                    )
-                    # cumulative sum over time
-                    cumsum = da.cumsum(ssp_in, axis=0)
-                    # append them as extra channels
-                    ssp_in = da.concatenate([ssp_in, delta, cumsum], axis=1)
+                    # --- Derived features ---
+                    if self.derived_features:
+                        delta = da.concatenate([ssp_in[0:1], ssp_in[1:] - ssp_in[:-1]], axis=0)
+                        cumsum = da.cumsum(ssp_in, axis=0)
+                        ssp_in = da.concatenate([ssp_in, delta, cumsum], axis=1)
+                        log.info("Appended derived features (Δ, cumsum).")
+                    else:
+                        log.info("Skipping derived features.")
 
+                    # split train/val
                     if ssp == val_ssp:
-                        # validation portion
+                        # val
                         val_input_list.append(ssp_in[-val_months:])
-                        val_sin_list.append(sin_da[-val_months:])
-                        val_cos_list.append(cos_da[-val_months:])
+                        if self.month_encoding:
+                            val_sin_list.append(sin_da[-val_months:])
+                            val_cos_list.append(cos_da[-val_months:])
                         val_output_list.append(ssp_out[-val_months:])
-                        # train portion
+                        # train
                         train_inputs_dask_list.append(ssp_in[:-val_months])
-                        train_sin_list.append(sin_da[:-val_months])
-                        train_cos_list.append(cos_da[:-val_months])
+                        if self.month_encoding:
+                            train_sin_list.append(sin_da[:-val_months])
+                            train_cos_list.append(cos_da[:-val_months])
                         train_outputs_dask_list.append(ssp_out[:-val_months])
                     else:
                         train_inputs_dask_list.append(ssp_in)
-                        train_sin_list.append(sin_da)
-                        train_cos_list.append(cos_da)
+                        if self.month_encoding:
+                            train_sin_list.append(sin_da)
+                            train_cos_list.append(cos_da)
                         train_outputs_dask_list.append(ssp_out)
 
-            # Concatenate val arrays
-            val_input_dask = da.concatenate(val_input_list, axis=0)
-            val_sin_dask   = da.concatenate(val_sin_list,   axis=0)
-            val_cos_dask   = da.concatenate(val_cos_list,   axis=0)
-            val_input_dask = da.concatenate(
-                [val_input_dask, val_sin_dask, val_cos_dask], axis=1
-            )
-            val_output_dask = da.concatenate(val_output_list, axis=0)
+            # concat train/val inputs
+            train_input_dask = da.concatenate(train_inputs_dask_list, axis=0)
+            val_input_dask   = da.concatenate(val_input_list,         axis=0)
+            if self.month_encoding:
+                train_input_dask = da.concatenate([train_input_dask,
+                                                  da.concatenate(train_sin_list,axis=0),
+                                                  da.concatenate(train_cos_list,axis=0)], axis=1)
+                val_input_dask   = da.concatenate([val_input_dask,
+                                                  da.concatenate(val_sin_list,axis=0),
+                                                  da.concatenate(val_cos_list,axis=0)], axis=1)
 
-            # Concatenate train arrays
-            train_input_dask  = da.concatenate(train_inputs_dask_list, axis=0)
-            train_sin_dask    = da.concatenate(train_sin_list,         axis=0)
-            train_cos_dask    = da.concatenate(train_cos_list,         axis=0)
-            train_input_dask  = da.concatenate(
-                [train_input_dask, train_sin_dask, train_cos_dask], axis=1
-            )
             train_output_dask = da.concatenate(train_outputs_dask_list, axis=0)
+            val_output_dask   = da.concatenate(val_output_list,         axis=0)
 
-            # (3) log-transform or power-transform on pr as before
-            # if "pr" in self.hparams.output_vars:
-            #     pr_idx = self.hparams.output_vars.index("pr")
-            #     pr_arr = train_output_dask[:, pr_idx:pr_idx+1, ...]
-            #     pr_log = da.log1p(pr_arr)
-            #     train_output_dask = da.concatenate([
-            #         train_output_dask[:, :pr_idx, ...],
-            #         pr_log,
-            #         train_output_dask[:, pr_idx+1:, ...]
-            #     ], axis=1)
-            train_output_dask = da.log1p(train_output_dask)
+            # --- PR transform ---
+            if "pr" in self.hparams.output_vars and self.pr_transform:
+                log.info("Log-transforming 'pr' on train and val.")
+                pr_idx = self.hparams.output_vars.index("pr")
+                pr_train = train_output_dask[:, pr_idx:pr_idx+1]
+                train_output_dask = da.concatenate([
+                    train_output_dask[:, :pr_idx],
+                    da.log1p(pr_train),
+                    train_output_dask[:, pr_idx+1:]
+                ], axis=1)
+                pr_val = val_output_dask[:, pr_idx:pr_idx+1]
+                val_output_dask = da.concatenate([
+                    val_output_dask[:, :pr_idx],
+                    da.log1p(pr_val),
+                    val_output_dask[:, pr_idx+1:]
+                ], axis=1)
+            else:
+                log.info("Skipping log-transform of 'pr'.")
 
+            # --- Spatial smoothing ---
+            if self.spatial_smoothing:
+                log.info("Applying spatial smoothing.")
+                coarse_train = coarsen(np.mean, train_input_dask, {2:2,3:2}, trim_excess=True)
+                train_input_dask = da.concatenate([train_input_dask,
+                                                  coarse_train.repeat(2,axis=2).repeat(2,axis=3)], axis=1)
+                coarse_val = coarsen(np.mean, val_input_dask, {2:2,3:2}, trim_excess=True)
+                val_input_dask = da.concatenate([val_input_dask,
+                                                coarse_val.repeat(2,axis=2).repeat(2,axis=3)], axis=1)
+            else:
+                log.info("Skipping spatial smoothing.")
 
-            # # --- (4) Spatial Smoothing / Multi-scale inputs ---
-            # # block-average to half-res, then upsample back
-            # coarse = coarsen(np.mean, train_input_dask, {2:2, 3:2}, trim_excess=True)
-            # # now coarse shape = (T, C*, ny//2, nx//2)
-            # coarse_up = coarse.repeat(2, axis=2).repeat(2, axis=3)
-            # train_input_dask = da.concatenate([train_input_dask, coarse_up], axis=1)
+            # --- Input scaling ---
+            arr_np = train_input_dask.compute()
+            if self.robust_scaling:
+                log.info("Using median+IQR for input scaling.")
+                med = np.nanmedian(arr_np, axis=0, keepdims=True)
+                q1  = np.nanpercentile(arr_np, 25, axis=0, keepdims=True)
+                q3  = np.nanpercentile(arr_np, 75, axis=0, keepdims=True)
+                iqr = np.where(q3 - q1 > 0, q3 - q1, 1.0)
+                self.normalizer.set_input_statistics(mean=med, std=iqr)
+            else:
+                log.info("Using mean+std for input scaling.")
+                m   = np.nanmean(arr_np, axis=0, keepdims=True)
+                s   = np.nanstd(arr_np, axis=0, keepdims=True)
+                s[s==0] = 1.0
+                self.normalizer.set_input_statistics(mean=m, std=s)
 
-            # coarse_val = coarsen(np.mean, val_input_dask, {2:2, 3:2}, trim_excess=True)
-            # coarse_val_up = coarse_val.repeat(2, axis=2).repeat(2, axis=3)
-            # val_input_dask = da.concatenate([val_input_dask, coarse_val_up], axis=1)
+            # --- Output scaling ---
+            out_mean = da.nanmean(train_output_dask, axis=(0,2,3), keepdims=True).compute()
+            out_std  = da.nanstd (train_output_dask, axis=(0,2,3), keepdims=True).compute()
+            self.normalizer.set_output_statistics(mean=out_mean, std=out_std)
 
-            # --- (5) Per-grid-cell robust scaling of inputs ---
-            # compute median & IQR **per cell** (axis=0 only)
-            arr_np = train_input_dask.compute()  # shape (T, C*, y, x)
-            med_cell = np.nanmedian(arr_np, axis=0, keepdims=True)            # (1, C*, y, x)
-            q1_cell  = np.nanpercentile(arr_np, 25, axis=0, keepdims=True)
-            q3_cell  = np.nanpercentile(arr_np, 75, axis=0, keepdims=True)
-            iqr_cell = np.where((q3_cell - q1_cell) > 0, q3_cell - q1_cell, 1.0)
-            self.normalizer.set_input_statistics(mean=med_cell, std=iqr_cell)
-
-            # Standard z-score for outputs
-            output_mean = da.nanmean(train_output_dask, axis=(0,2,3), keepdims=True).compute()
-            output_std  = da.nanstd (train_output_dask, axis=(0,2,3), keepdims=True).compute()
-            self.normalizer.set_output_statistics(mean=output_mean, std=output_std)
-
-            # Normalize train & val
-            train_input_norm_dask  = self.normalizer.normalize(train_input_dask,  data_type="input")
+            # normalize
+            train_input_norm_dask  = self.normalizer.normalize(train_input_dask, data_type="input")
             train_output_norm_dask = self.normalizer.normalize(train_output_dask, data_type="output")
             val_input_norm_dask    = self.normalizer.normalize(val_input_dask,    data_type="input")
+            val_output_norm_dask   = self.normalizer.normalize(val_output_dask,   data_type="output")
 
-            # apply same pr‐transform to val outputs
-            # if "pr" in self.hparams.output_vars:
-            #     pr_idx = self.hparams.output_vars.index("pr")
-            #     pr_arr = val_output_dask[:, pr_idx:pr_idx+1, ...]
-            #     pr_log = da.log1p(pr_arr)
-            #     val_output_dask = da.concatenate([
-            #         val_output_dask[:, :pr_idx, ...],
-            #         pr_log,
-            #         val_output_dask[:, pr_idx+1:, ...]
-            #     ], axis=1)
-            val_output_dask = da.log1p(val_output_dask)
-            val_output_norm_dask = self.normalizer.normalize(val_output_dask, data_type="output")
-            
-            # --- Prepare Test Data & apply SAME pipeline ---
-            full_test_input_dask, full_test_output_dask = _load_process_ssp_data(
-                ds,
-                self.hparams.test_ssp,
-                self.hparams.input_vars,
-                self.hparams.output_vars,
-                self.hparams.target_member_id,
-                spatial_template_da,
-            )
-            test_slice = slice(-self.hparams.test_months, None)
-            test_in  = full_test_input_dask[test_slice]
-            test_out = full_test_output_dask[test_slice]
+            # --- Prepare test ---
+            full_in, full_out = _load_process_ssp_data(
+                ds, self.hparams.test_ssp, self.hparams.input_vars,
+                self.hparams.output_vars, self.hparams.target_member_id,
+                spatial_template_da)
+            slice_t = slice(-self.hparams.test_months, None)
+            test_in = full_in[slice_t]; test_out = full_out[slice_t]
 
-            # derived features on test
-            delta_t = da.concatenate([test_in[0:1], test_in[1:] - test_in[:-1]], axis=0)
-            csum_t  = da.cumsum(test_in, axis=0)
-            test_in = da.concatenate([test_in, delta_t, csum_t], axis=1)
-            
-            # sin/cos
-            sin_t = sin_da[test_slice]; cos_t = cos_da[test_slice]
-            test_in = da.concatenate([test_in, sin_t, cos_t], axis=1)
-            
-            # # spatial smoothing
-            # coarse_t = coarsen(np.mean, test_in, {2:2, 3:2}, trim_excess=True)
-            # test_in = da.concatenate([test_in, coarse_t.repeat(2,2).repeat(2,3)], axis=1)
-            
-            # normalize
+            # derived
+            if self.derived_features:
+                d = da.concatenate([test_in[0:1], test_in[1:] - test_in[:-1]], axis=0)
+                c = da.cumsum(test_in, axis=0)
+                test_in = da.concatenate([test_in, d, c], axis=1)
+            # month encoding
+            if self.month_encoding:
+                test_in = da.concatenate([test_in,
+                                          sin_da[slice_t],
+                                          cos_da[slice_t]], axis=1)
+            # smoothing
+            if self.spatial_smoothing:
+                c_t = coarsen(np.mean, test_in, {2:2,3:2}, trim_excess=True)
+                test_in = da.concatenate([test_in,
+                                          c_t.repeat(2,2).repeat(2,3)], axis=1)
+
             test_input_norm_dask = self.normalizer.normalize(test_in, data_type="input")
-            # pr log-transform on test
-            # if "pr" in self.hparams.output_vars:
-            #     pr_idx = self.hparams.output_vars.index("pr")
-            #     pr_arr_t = test_out[:, pr_idx:pr_idx+1, ...]
-            #     pr_log_t = da.log1p(pr_arr_t)
-            #     test_out = da.concatenate([
-            #         test_out[:, :pr_idx, ...],
-            #         pr_log_t,
-            #         test_out[:, pr_idx+1:, ...]
-            #     ], axis=1)
-            # test_output_raw_dask = test_out
-            test_output_raw_dask = da.log1p(test_out)
+            test_output_raw_dask = test_out
 
-            
-        # Create datasets
-        self.train_dataset = ClimateDataset(train_input_norm_dask,  train_output_norm_dask, output_is_normalized=True)
-        self.val_dataset   = ClimateDataset(val_input_norm_dask,    val_output_norm_dask,   output_is_normalized=True)
-        self.test_dataset  = ClimateDataset(test_input_norm_dask,   test_output_raw_dask,   output_is_normalized=False)
+        self.train_dataset = ClimateDataset(train_input_norm_dask, train_output_norm_dask, True)
+        self.val_dataset   = ClimateDataset(val_input_norm_dask,   val_output_norm_dask,   True)
+        self.test_dataset  = ClimateDataset(test_input_norm_dask,  test_output_raw_dask,   False)
 
-        log.info(
-            f"Datasets created. Train: {len(self.train_dataset)}, Val: {len(self.val_dataset)} (last months of {val_ssp}), Test: {len(self.test_dataset)}"
-        )
+        log.info(f"Datasets created. Train: {len(self.train_dataset)}, Val: {len(self.val_dataset)}, Test: {len(self.test_dataset)}")
 
 
     # Common DataLoader configuration
@@ -418,16 +418,50 @@ class ClimateEmulationDataModule(LightningDataModule):
 
 # --- PyTorch Lightning Module ---
 class ClimateEmulationModule(pl.LightningModule):
-    def __init__(self, model: nn.Module, learning_rate: float):
+    def __init__(
+        self, 
+        model: nn.Module, 
+        loss: str = "MSE",
+        loss_params = None,
+        optimizer: str = "",
+        learning_rate: float = 1e-4, 
+        scheduler: str = "", 
+        scheduler_params = None,
+        edge_weight: float = 0.1
+    ):
         super().__init__()
         self.model = model
         # Access hyperparams via self.hparams object after saving, e.g., self.hparams.learning_rate
         self.save_hyperparameters(ignore=["model"])
-        self.criterion = nn.MSELoss()
+        if loss == "L1":
+            log.info("Using L1 loss")
+            self.criterion = nn.L1Loss()
+        elif loss == "SmoothL1":
+            if loss_params:
+                beta = loss_params.get("beta", 0.5)
+            else:
+                beta =  0.5
+            log.info(f"Using Smooth L1 loss w/ beta {beta}")
+            self.criterion = nn.SmoothL1Loss(beta)
+        else: 
+            log.info("Defaulted to MSE loss")
+            self.criterion = nn.MSELoss()
+
         self.normalizer = None
         # Store evaluation outputs for time-mean calculation
         self.test_step_outputs = []
         self.validation_step_outputs = []
+        if scheduler and scheduler_params: 
+            self.scheduler = scheduler
+            self.scheduler_params = scheduler_params
+
+        # Save Edge Weight 
+        self.edge_weight = edge_weight
+        
+        # Prepare Sobel filters as buffers
+        sobel = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]], dtype=torch.float32)
+        self.register_buffer('sobel_x', sobel.unsqueeze(0).unsqueeze(0))
+        self.register_buffer('sobel_y', sobel.t().unsqueeze(0).unsqueeze(0))
 
     def forward(self, x):
         return self.model(x)
@@ -435,24 +469,55 @@ class ClimateEmulationModule(pl.LightningModule):
     def on_fit_start(self) -> None:
         self.normalizer = self.trainer.datamodule.normalizer  # Access the normalizer from the datamodule
 
+    def gradient_loss(self, pred, tgt):
+        # apply Sobel per-channel via grouped convolution
+        C = pred.shape[1]
+        sx = self.sobel_x.repeat(C, 1, 1, 1)
+        sy = self.sobel_y.repeat(C, 1, 1, 1)
+        gx_pred = F.conv2d(pred, sx, padding=1, groups=C)
+        gx_tgt  = F.conv2d(tgt,  sx, padding=1, groups=C)
+        gy_pred = F.conv2d(pred, sy, padding=1, groups=C)
+        gy_tgt  = F.conv2d(tgt,  sy, padding=1, groups=C)
+        return ((gx_pred - gx_tgt).abs() + (gy_pred - gy_tgt).abs()).mean()
+
     def training_step(self, batch, batch_idx):
+        # report loss in transformed space
         x, y_true_norm = batch
         y_pred_norm = self(x)
-        loss = self.criterion(y_pred_norm, y_true_norm)
+
+        main_loss = self.criterion(y_pred_norm, y_true_norm)
+        edge_loss = self.gradient_loss(y_pred_norm, y_true_norm)  / (torch.mean(torch.abs(y_true_norm)) + 1e-6)
+        loss = main_loss + (self.edge_weight * edge_loss)
+
+        self.log("train/main_loss", main_loss, prog_bar=True, batch_size=x.size(0))
+        self.log("train/edge_loss", edge_loss, prog_bar=True, batch_size=x.size(0))
         self.log("train/loss", loss, prog_bar=True, batch_size=x.size(0))
+
+        # loss = self.criterion(y_pred_norm, y_true_norm)
+        # self.log("train/loss", loss, prog_bar=True, batch_size=x.size(0))
+
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y_true_norm = batch
-        y_pred_norm = self(x)
-        loss = self.criterion(y_pred_norm, y_true_norm)
+        # report loss in transformed space
+        x, y_true_log_norm = batch
+        y_pred_log_norm = self(x)
+        loss = self.criterion(y_pred_log_norm, y_true_log_norm)
         self.log("val/loss", loss, on_step=False, on_epoch=True, prog_bar=True, batch_size=x.size(0), sync_dist=True)
 
-        # Save unnormalized outputs for decadal mean/stddev calculation in validation_epoch_end
-        y_pred_norm = self.normalizer.inverse_transform_output(y_pred_norm.cpu().numpy())
-        y_true_norm = self.normalizer.inverse_transform_output(y_true_norm.cpu().numpy())
-        self.validation_step_outputs.append((y_pred_norm, y_true_norm))
+        # save outputs for decadal mean/stddev calculation in validation_epoch_end
+        # 1) de-norm
+        y_pred_log = self.normalizer.inverse_transform_output(y_pred_log_norm.cpu().numpy())
+        y_true_log  = self.normalizer.inverse_transform_output(y_true_log_norm.cpu().numpy())
 
+        # 2) de-log
+        if "pr" in self.trainer.datamodule.hparams.output_vars:
+            pr_idx = self.trainer.datamodule.hparams.output_vars.index("pr")
+            y_pred_log[:, pr_idx] = np.expm1(y_pred_log[:, pr_idx])
+            y_true_log[:, pr_idx] = np.expm1(y_true_log[:, pr_idx])
+
+        # 3) evaluate in un-transformed space
+        self.validation_step_outputs.append((y_pred_log, y_true_log))
         return loss
 
     def _evaluate_predictions(self, predictions, targets, is_test=False):
@@ -466,6 +531,7 @@ class ClimateEmulationModule(pl.LightningModule):
         """
         phase = "test" if is_test else "val"
         log_kwargs = {"prog_bar": not is_test, "sync_dist": not is_test}
+        current_epoch = self.current_epoch
 
         # Get number of evaluation timesteps
         n_timesteps = predictions.shape[0]
@@ -517,6 +583,7 @@ class ClimateEmulationModule(pl.LightningModule):
             if is_test:
                 # Generate visualizations for test phase when using wandb
                 if isinstance(self.logger, WandbLogger):
+                    print("Logging everything in wandb")
                     # Time mean visualization
                     fig = create_comparison_plots(
                         true_time_mean,
@@ -549,6 +616,57 @@ class ClimateEmulationModule(pl.LightningModule):
                             fig = create_comparison_plots(true_t, pred_t, title_prefix=f"{var_name} Timestep {t}")
                             self.logger.experiment.log({f"img/{var_name}/month_idx_{t}": wandb.Image(fig)})
                             plt.close(fig)
+            elif (not is_test) and ((current_epoch == 0) or (current_epoch == self.trainer.max_epochs - 1)):
+                print("Logging validation stuff")
+                prefix = f"val_img_{current_epoch}/{var_name}"
+                # 1) time‐mean
+                fig = create_comparison_plots(
+                    true_time_mean,
+                    pred_time_mean,
+                    title_prefix=f"{var_name} Val Mean (Epoch {current_epoch})",
+                    metric_value=time_mean_rmse,
+                    metric_name="Weighted RMSE",
+                )
+                try:
+                    if isinstance(self.logger, WandbLogger):
+                        self.logger.experiment.log({f"{prefix}/time_mean": wandb.Image(fig)})
+                except Exception as e:
+                    fig.savefig(f"{prefix.replace('/', '_')}_time_mean.png")
+                plt.close(fig)
+
+                # 2) time‐stddev
+                fig = create_comparison_plots(
+                    true_time_std,
+                    pred_time_std,
+                    title_prefix=f"{var_name} Val Stddev (Epoch {current_epoch})",
+                    metric_value=time_std_mae,
+                    metric_name="Weighted MAE",
+                    cmap="plasma",
+                )
+                try:
+                    if isinstance(self.logger, WandbLogger):
+                        self.logger.experiment.log({f"{prefix}/time_stddev": wandb.Image(fig)})
+                except Exception as e:
+                    fig.savefig(f"{prefix.replace('/', '_')}_time_stddev.png")
+                plt.close(fig)
+
+                # 3) three random timesteps
+                if n_timesteps > 3:
+                    steps = np.random.choice(n_timesteps, 3, replace=False)
+                    for t in steps:
+                        true_t = trues_xr.isel(time=t)
+                        pred_t = preds_xr.isel(time=t)
+                        fig = create_comparison_plots(
+                            true_t,
+                            pred_t,
+                            title_prefix=f"{var_name} Val Timestep {t} (Ep {current_epoch})",
+                        )
+                        try:
+                            if isinstance(self.logger, WandbLogger):
+                                self.logger.experiment.log({f"{prefix}/timestep_{t}": wandb.Image(fig)})
+                        except Exception:
+                            fig.savefig(f"{prefix.replace('/', '_')}_t{t}.png")
+                        plt.close(fig)
 
     def on_validation_epoch_end(self):
         # Compute time-mean and time-stddev errors using all validation months
@@ -566,11 +684,21 @@ class ClimateEmulationModule(pl.LightningModule):
 
     def test_step(self, batch, batch_idx):
         x, y_true_denorm = batch
-        y_pred_norm = self(x)
-        # Denormalize the predictions for evaluation back to original scale
-        y_pred_denorm = self.normalizer.inverse_transform_output(y_pred_norm.cpu().numpy())
-        y_true_denorm_np = y_true_denorm.cpu().numpy()
-        self.test_step_outputs.append((y_pred_denorm, y_true_denorm_np))
+        y_pred_log_norm = self(x)
+
+        # 1) de-norm predictions
+        y_pred_log = self.normalizer.inverse_transform_output(y_pred_log_norm.cpu().numpy())
+
+        # 2) de-log predictions
+        if (
+            "pr" in self.trainer.datamodule.hparams.output_vars 
+            and self.trainer.datamodule.hparams.pr_transform
+        ):          
+            pr_idx = self.trainer.datamodule.hparams.output_vars.index("pr")
+            y_pred_log[:, pr_idx] = np.expm1(y_pred_log[:, pr_idx])
+
+        # record testing metrics and submission in untransformed space
+        self.test_step_outputs.append((y_pred_log, y_true_denorm.cpu().numpy()))
 
     def on_test_epoch_end(self):
         # Concatenate all predictions and ground truths from each test step/batch into one array
@@ -619,14 +747,21 @@ class ClimateEmulationModule(pl.LightningModule):
 
     def configure_optimizers(self):
         optimizer = optim.Adam(self.parameters(), lr=self.hparams.learning_rate)
-        if self.hparams.get("scheduler", None) == "cosine":
-             print("Using cosine LR")
-             sched = optim.lr_scheduler.CosineAnnealingLR(
-                 optimizer,
-                 T_max=self.hparams.scheduler_params.T_max,
-                 eta_min=self.hparams.scheduler_params.eta_min,
-             )
-             return [optimizer], [sched]
+        if self.scheduler_params:
+            log.info(f"scheduler_params: {self.scheduler_params}")
+            if self.scheduler == "cosine":
+                log.info("Using CosineAnnealingLR scheduler")
+                sched = optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer,
+                    T_max=self.scheduler_params.T_max,
+                    eta_min=self.scheduler_params.eta_min,
+                )
+                return [optimizer], [sched]
+            else:
+                log.info("No scheduler provided.")
+        else:
+            log.info("No scheduler_params provided")
+        log.info("Using Adam optimizer")
         return optimizer
         
 # --- Temporal Versions ---
@@ -721,19 +856,28 @@ def main(cfg: DictConfig):
     # datamodule = ClimateEmulationDataModule(seed=cfg.seed, **cfg.data)
 
     # TO-DO: Fix unexpected keyword window_length when using SimpleCNN
-    temporal_models = {"temporal_cnn"}
+    temporal_models = {"temporal_cnn", "st_vit"}
     dm_kwargs   = dict(cfg.data) # convert ΩConf to plain dict
     win_length  = dm_kwargs.pop("window_length", 1)
     
-    DMClass = TemporalClimateEmulationDataModule if cfg.model.type in temporal_models \
-             else ClimateEmulationDataModule
-    
-    datamodule = DMClass(seed=cfg.seed, window_length=win_length, **dm_kwargs)
+    datamodule = None
+    if cfg.model.type in temporal_models:
+        datamodule = TemporalClimateEmulationDataModule(seed=cfg.seed, window_length=win_length, **dm_kwargs)
+    else:
+        datamodule = ClimateEmulationDataModule(seed=cfg.seed, **dm_kwargs)
 
     model = get_model(cfg)
 
     # Create lightning module
-    lightning_module = ClimateEmulationModule(model, learning_rate=cfg.training.lr)
+    lightning_module = ClimateEmulationModule(
+        model, 
+        loss=cfg.training.loss,
+        learning_rate=cfg.training.lr, 
+        optimizer=cfg.training.optimizer,
+        scheduler=cfg.training.scheduler,
+        scheduler_params=cfg.training.scheduler_params,
+        edge_weight=cfg.training.edge_weight
+    )
 
     # Create lightning trainer
     trainer_config = get_trainer_config(cfg, model=model)

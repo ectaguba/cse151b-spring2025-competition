@@ -1,6 +1,0 @@
-# @package _global_.model
-type: dilated_res           # ← maps to DilatedResNet
-
-init_dim: 64                # channels after first conv
-depth: 6                    # number of residual blocks
-dropout_rate: 0.2

@@ -1,18 +1,34 @@
 import torch
 import torch.nn as nn
 from omegaconf import DictConfig
+import torch.nn.functional as F
 
 
 def get_model(cfg: DictConfig):
     model_kwargs = {k: v for k, v in cfg.model.items() if k != "type"}
-    # raw vars
-    # model_kwargs["n_input_channels"]  = len(cfg.data.input_vars)
-    
-    # raw vars, month encoding, spatial features (coarse), deltas and cumulatives
-    # model_kwargs ["n_input_channels"] = (3 * len(cfg.data.input_vars) + 2) * 2
 
-    # raw vars, month encoding, deltas and cumulatives
-    model_kwargs["n_input_channels"] = 3 * len(cfg.data.input_vars) + 2
+    # 1) Base raw-variable channels
+    C0 = len(cfg.data.input_vars)
+
+    # 2) Derived features: raw + Δ + cumsum
+    if getattr(cfg.data, "derived_features", True):
+        C1 = C0 * 3
+    else:
+        C1 = C0
+
+    # 3) Month encoding (sin & cos)
+    if getattr(cfg.data, "month_encoding", True):
+        C2 = C1 + 2
+    else:
+        C2 = C1
+
+    # 4) Spatial smoothing duplicates all existing channels
+    if getattr(cfg.data, "spatial_smoothing", False):
+        C3 = C2 * 2
+    else:
+        C3 = C2
+
+    model_kwargs["n_input_channels"]  = C3
     model_kwargs["n_output_channels"] = len(cfg.data.output_vars)
 
     t = cfg.model.type
@@ -20,14 +36,10 @@ def get_model(cfg: DictConfig):
         model = SimpleCNN(**model_kwargs)
     elif t == "temporal_cnn":
         model = TemporalCNN(**model_kwargs)
-    elif t == "temporal_tcn":
-        model = TemporalTCN(**model_kwargs)
-    elif t == "unet_res":
-        model = UNetRes(**model_kwargs)
-    elif t == "dilated_res":
-        model = DilatedResNet(**model_kwargs)
-    elif t == "temporal_unet_dilated":
-        model = TemporalUNetDilated(**model_kwargs)
+    elif t == "st_vit":
+        return SpatiotemporalViT(**model_kwargs)
+    elif t == "unet2d":
+        return UNet2D_TimeAsChannels(**model_kwargs)
     else:
         raise ValueError(f"Unknown model type: {t}")
 
@@ -42,17 +54,17 @@ def get_model(cfg: DictConfig):
 
 class ResidualBlock(nn.Module):
     """Residual 2‑D block identical to your original."""
-    def __init__(self, in_channels, out_channels, k=3, s=1):
+    def __init__(self, n_input_channels, n_output_channels, k=3, s=1):
         super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, k, stride=s, padding=k // 2)
-        self.bn1   = nn.BatchNorm2d(out_channels)
+        self.conv1 = nn.Conv2d(n_input_channels, n_output_channels, k, stride=s, padding=k // 2)
+        self.bn1   = nn.BatchNorm2d(n_output_channels)
         self.relu  = nn.ReLU(inplace=True)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, k, padding=k // 2)
-        self.bn2   = nn.BatchNorm2d(out_channels)
+        self.conv2 = nn.Conv2d(n_output_channels, n_output_channels, k, padding=k // 2)
+        self.bn2   = nn.BatchNorm2d(n_output_channels)
         self.skip  = nn.Sequential()
-        if s != 1 or in_channels != out_channels:
+        if s != 1 or n_input_channels != n_output_channels:
             self.skip = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, 1, stride=s), nn.BatchNorm2d(out_channels)
+                nn.Conv2d(n_input_channels, n_output_channels, 1, stride=s), nn.BatchNorm2d(n_output_channels)
             )
 
     def forward(self, x):
@@ -66,10 +78,11 @@ class SEBlock(nn.Module):
     """Lightweight squeeze‑and‑excitation (optional)."""
     def __init__(self, c, r=16):
         super().__init__()
+        reduced = max(1, c // r)
         self.fc = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(c, c // r, 1, bias=False), nn.ReLU(inplace=True),
-            nn.Conv2d(c // r, c, 1, bias=False), nn.Sigmoid()
+            nn.Conv2d(c, reduced, 1, bias=False), nn.ReLU(inplace=True),
+            nn.Conv2d(reduced, c, 1, bias=False), nn.Sigmoid()
         )
     def forward(self, x): return x * self.fc(x)
 
@@ -137,6 +150,15 @@ class ConvLSTMCell(nn.Module):
         super().__init__()
         padding = k // 2
         self.conv = nn.Conv2d(in_c + hid_c, 4 * hid_c, k, padding=padding)
+        self.hidden_dim = hid_c
+
+    def init_state(self, batch_size: int, spatial_size: tuple[int, int], device=None):
+        """Return h₀, c₀ each shaped (B, hidden_dim, H, W)."""
+        H, W = spatial_size
+        device = device or next(self.parameters()).device
+        h0 = torch.zeros(batch_size, self.hidden_dim, H, W, device=device)
+        c0 = torch.zeros_like(h0)
+        return h0, c0
 
     def forward(self, x, h, c):
         # x: [B, C, H, W]   h, c: [B, Hc, H, W]
@@ -209,129 +231,205 @@ class TemporalCNN(nn.Module):
         out = self.dropout(self.se(feat))
         return self.head(out)
 
+
 # ----------------------------------------------------------------------
-# 6. SimVP-v2  (3-D Conv encoder–decoder with Gated ST Attention)
+# 2. UNet2D_TImeAsChannels
 # ----------------------------------------------------------------------
-class GSTA(nn.Module):
-    """Gated Spatiotemporal Attention – single SE-style gate on 3-D feature."""
-    def __init__(self, c, r=8):
+class DoubleConv(nn.Module):
+    """Two consecutive 3×3 convolutions + BN + ReLU."""
+    def __init__(self, in_channels, out_channels):
         super().__init__()
-        self.fc = nn.Sequential(
-            nn.AdaptiveAvgPool3d(1),
-            nn.Conv3d(c, c // r, 1), nn.ReLU(inplace=True),
-            nn.Conv3d(c // r, c, 1), nn.Sigmoid()
+        self.double_conv = nn.Sequential(
+            nn.Conv2d(in_channels,  out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True),
         )
-    def forward(self, x):
-        return x * self.fc(x)
-
-def _conv3d_block(in_c, out_c, k=(3,3,3), s=1, p=(1,1,1)):
-    return nn.Sequential(
-        nn.Conv3d(in_c, out_c, k, stride=s, padding=p),
-        nn.BatchNorm3d(out_c), nn.ReLU(inplace=True)
-    )
-
-class SimVPv2(nn.Module):
-    r"""[B,T,C,H,W] → [B,C_out,H,W]"""
-    def __init__(self, n_input_channels, n_output_channels,
-                 width=64, depth=4, dropout_rate=0.1):
-        super().__init__()
-        self.enc = nn.Sequential(*[
-            _conv3d_block(n_input_channels if i==0 else width,
-                          width) for i in range(depth)
-        ])
-        self.gate = GSTA(width)
-        self.dec = nn.Sequential(*[
-            _conv3d_block(width, width) for _ in range(depth)
-        ])
-        self.head = nn.Conv2d(width, n_output_channels, 1)
-        self.dp   = nn.Dropout(dropout_rate)
 
     def forward(self, x):
-        # [B,T,C,H,W] → [B,C,T,H,W]
-        x = x.permute(0,2,1,3,4).contiguous()
-        z = self.gate(self.enc(x))
-        z = self.dec(z)
-        # take last timestep
-        z = z[:, :, -1]          # [B,C,H,W]
-        return self.head(self.dp(z))
+        return self.double_conv(x)
 
+
+class UNet2D_TimeAsChannels(nn.Module):
+    def __init__(self, n_input_channels, n_output_channels, base_features=64, depth=4):
+        super().__init__()
+        # Save for forward
+        self.depth = depth
+
+        # --------------------
+        # Encoder path
+        # --------------------
+        self.encoders = nn.ModuleList()
+        in_ch = n_input_channels
+        out_ch = base_features
+        # First encoder block
+        self.encoders.append(DoubleConv(in_ch, out_ch))
+        # Subsequent encoder blocks (each halves H×W, doubles channels)
+        for _ in range(1, depth):
+            in_ch = out_ch
+            out_ch = out_ch * 2
+            self.encoders.append(DoubleConv(in_ch, out_ch))
+
+        # MaxPool layer to use between encoder blocks
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+        # --------------------
+        # Bottleneck (bottom of U)
+        # --------------------
+        in_ch = out_ch
+        out_ch = out_ch * 2
+        self.bottleneck = DoubleConv(in_ch, out_ch)
+
+        # --------------------
+        # Decoder path
+        # --------------------
+        self.uptrans = nn.ModuleList()
+        self.decoders = nn.ModuleList()
+        in_ch = out_ch
+        for _ in range(depth):
+            # ConvTranspose2d upsamples by factor of 2
+            out_ch = in_ch // 2
+            self.uptrans.append(
+                nn.ConvTranspose2d(in_ch, out_ch, kernel_size=2, stride=2)
+            )
+            # After concatenation, channel count doubles, so DoubleConv(in_ch, out_ch)
+            self.decoders.append(DoubleConv(in_ch, out_ch))
+            in_ch = out_ch
+
+        # --------------------
+        # Final 1×1 conv to map to desired output channels
+        # --------------------
+        self.final_conv = nn.Conv2d(base_features, n_output_channels, kernel_size=1)
+
+    def forward(self, x):
+        """
+        x: (B, n_input_channels, H, W), where n_input_channels = M × T
+        returns: (B, n_output_channels, H, W)
+        """
+        skip_connections = []
+        out = x
+
+        # Encoder: collect skip connections
+        for enc in self.encoders:
+            out = enc(out)
+            skip_connections.append(out)
+            out = self.pool(out)
+
+        # Bottleneck
+        out = self.bottleneck(out)
+
+        # Decoder: upsample + concatenate + double conv
+        for idx in range(self.depth):
+            out = self.uptrans[idx](out)
+            skip = skip_connections[-(idx + 1)]
+
+            # In case the upsampled size doesn't exactly match due to rounding, interpolate:
+            if out.shape[2:] != skip.shape[2:]:
+                out = F.interpolate(out, size=skip.shape[2:], mode="bilinear", align_corners=False)
+
+            # Concatenate along channel dim
+            out = torch.cat([skip, out], dim=1)
+            out = self.decoders[idx](out)
+
+        # Final 1×1 conv to produce output_channels
+        out = self.final_conv(out)
+        return out
 
 # ----------------------------------------------------------------------
-# 7. E3D-LSTM  (Eidetic 3-D ConvLSTM stack)
+# 3. SpatiotemporalViT (our “st_vit” type)
 # ----------------------------------------------------------------------
-class E3DLSTMCell(nn.Module):
-    def __init__(self, in_c, hid_c, k=3):
+class SpatiotemporalViT(nn.Module):
+    """
+    A simple Vision Transformer that takes [B, T, 1, H, W] → [B, 1, H, W].
+    Hidden_channels = d_model (embedding size).
+    Depth = number of TransformerEncoder layers.
+    n_heads = number of attention heads.
+    patch_size = P (assumes H, W divisible by P).
+    """
+    def __init__(
+        self,
+        n_input_channels:  int = 1,
+        n_output_channels: int = 1,
+        hidden_channels:   int = 128,   # d_model
+        depth:             int = 4,     # num Transformer layers
+        n_heads:           int = 8,
+        patch_size:        int = 8,
+        dropout_rate:      float = 0.1,
+        window_length:     int = 3,
+        H:                 int = 48,
+        W:                 int = 72,
+    ):
         super().__init__()
-        p = k//2
-        self.conv = nn.Conv3d(in_c + hid_c, 7*hid_c,
-                              kernel_size=(1,k,k),
-                              padding=(0,p,p))
+        self.P = patch_size
+        self.T = window_length
+        self.d_model = hidden_channels
+        self.n_heads = n_heads
+        self.depth = depth
 
-    def forward(self, x, h, c, m):
-        # x,h,c,m : [B, C, 1, H, W]  (keep T dim =1)
-        if m is None:
-            m = torch.zeros_like(c)
-        feats = torch.cat([x, h, m], dim=1)
-        gates = self.conv(feats).chunk(7, dim=1)
-        i,f,o,g,ii,ff,gg = gates
-        i,f,o,ii,ff = map(torch.sigmoid, (i,f,o,ii,ff))
-        g,gg = map(torch.tanh, (g,gg))
-        c_next = f*c + i*g
-        m_next = ff*m + ii*gg
-        h_next = o*torch.tanh(c_next)
-        return h_next, c_next, m_next
+        self.n_patches_h = H // self.P
+        self.n_patches_w = W // self.P
+        self.num_patches = self.n_patches_h * self.n_patches_w
 
-class E3DLSTM(nn.Module):
-    def __init__(self, n_input_channels, n_output_channels,
-                 hid_c=64, layers=2):
-        super().__init__()
-        self.spat_enc = nn.Conv3d(n_input_channels, hid_c, 3, padding=1)
-        self.cells = nn.ModuleList([E3DLSTMCell(hid_c, hid_c)
-                                    for _ in range(layers)])
-        self.head = nn.Conv2d(hid_c, n_output_channels, 1)
+        # 1) Patch embedding: each P×P → d_model
+        self.patch_embed = nn.Conv2d(n_input_channels, hidden_channels, kernel_size=self.P, stride=self.P)
 
-    def forward(self, x):              # [B,T,C,H,W]
-        B,T,C,H,W = x.shape
-        h = [torch.zeros(B, 64, 1, H, W, device=x.device) for _ in self.cells]
-        c = [torch.zeros_like(hh) for hh in h]
-        m = None
+        # 2) Spatial position embeddings (num_patches × d_model)
+        self.spatial_pos = nn.Parameter(torch.randn(1, self.num_patches, hidden_channels))
+
+        # 3) Temporal position embeddings (window_length × d_model)
+        self.temporal_pos = nn.Parameter(torch.randn(1, self.T, hidden_channels))
+
+        # 4) Transformer Encoder
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_channels,
+            nhead=n_heads,
+            dim_feedforward=4 * hidden_channels,
+            dropout=dropout_rate,
+            activation="gelu",
+            batch_first=False,  # PyTorch default: sequence first
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=depth)
+
+        # 5) Linear decoder: d_model → (P×P)
+        self.decoder_lin = nn.Linear(hidden_channels, self.P * self.P)
+
+        # 6) Final conv to blend patches back to one channel
+        self.final_conv = nn.Conv2d(1, n_output_channels, kernel_size=1)
+
+    def forward(self, x):
+        # x: [B, T, 1, H, W]
+        if x.ndim == 4:
+            x = x.unsqueeze(1)  # allow [B, 1, H, W]
+        B, T, C, H, W = x.shape
+        assert T == self.T, f"Expected window length {self.T}, got {T}"
+
+        # 1) Patchify each t
+        tokens = []
         for t in range(T):
-            z = self.spat_enc(x[:,t].unsqueeze(2))   # add dummy T dim
-            h[0],c[0],m = self.cells[0](z,h[0],c[0],m)
-            for l in range(1,len(self.cells)):
-                h[l],c[l],m = self.cells[l](h[l-1],h[l],c[l],m)
-        out = h[-1].squeeze(2)   # [B,C,H,W]
-        return self.head(out)
+            patch_feats = self.patch_embed(x[:, t])  # [B, d_model, H/P, W/P]
+            patch_feats = patch_feats.flatten(2).transpose(1, 2)
+            # [B, num_patches, d_model]
+            tokens.append(patch_feats + self.spatial_pos)
 
+        tokens = torch.stack(tokens, dim=1)  # [B, T, num_patches, d_model]
+        # Add temporal pos (broadcast over num_patches)
+        tokens = tokens + self.temporal_pos.unsqueeze(2)  # [1, T, 1, d_model]
 
-# ----------------------------------------------------------------------
-# 8. STCNet  (Hybrid temporal 1-D + spatial 2-D convs)
-# ----------------------------------------------------------------------
-class STCNet(nn.Module):
-    def __init__(self, n_input_channels, n_output_channels,
-                 t_channels=64, k_temporal=3, blocks=4):
-        super().__init__()
-        # 1-D temporal conv over channel-stacked map (depth-wise)
-        self.temporal = nn.Sequential(*[
-            nn.Conv3d(n_input_channels, n_input_channels,
-                      kernel_size=(k_temporal,1,1),
-                      padding=((k_temporal-1)//2,0,0),
-                      groups=n_input_channels),
-            nn.ReLU(inplace=True)
-        ])
-        # spatial encoder
-        layers=[]; c=n_input_channels
-        for _ in range(blocks):
-            layers += [ResidualBlock(c, t_channels),]
-            c = t_channels
-        self.spatial = nn.Sequential(*layers)
-        self.head = nn.Conv2d(c, n_output_channels, 1)
+        # Merge T & num_patches into sequence dim S = T * num_patches
+        tokens = tokens.view(B, T * self.num_patches, self.d_model)  # [B, S, d_model]
+        tokens = tokens.permute(1, 0, 2)  # [S, B, d_model]
 
-    def forward(self, x):                 # [B,T,C,H,W]
-        # fuse time with depth-wise temporal conv
-        z = self.temporal(x.permute(0,2,1,3,4))      # [B,C,T,H,W]
-        # collapse T by max-pool
-        z = torch.max(z, dim=2).values               # [B,C,H,W]
-        z = self.spatial(z)
-        return self.head(z)
+        # 2) Transformer
+        out_tokens = self.transformer(tokens)  # [S, B, d_model]
+        out_tokens = out_tokens.permute(1, 0, 2).view(B, T, self.num_patches, self.d_model)
 
+        # 3) Take only the last time slice (predict T+1 from t=1..T)
+        last_tokens = out_tokens[:, -1, :, :]  # [B, num_patches, d_model]
+        decoded = self.decoder_lin(last_tokens)  # [B, num_patches, P×P]
+
+        # 4) Reconstruct to [B, 1, H, W]
+        decoded = decoded.view(B, self.n_patches_h, self.n_patches_w, self.P, self.P)
+        decoded = decoded.permute(0, 1, 3, 2, 4).reshape(B, 1, H, W)
+        return self.final_conv(decoded)  # [B, 1, H, W]

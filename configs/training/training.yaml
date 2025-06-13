@@ -1,3 +1,13 @@
 # @package _global_.training
 
-lr: 5e-4
+lr: 1e-4
+loss: SmoothL1
+loss_params:
+  beta: 0.5
+optimizer: Adam
+scheduler: cosine
+scheduler_params:
+  T_max: 7        
+  eta_min: 5e-6    
+
+edge_weight: 0.5 # higher for more edge emphasis
