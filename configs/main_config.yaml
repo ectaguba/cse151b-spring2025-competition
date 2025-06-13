@@ -2,7 +2,7 @@
 
 defaults:
   - data: data
-  - model: swin_lstm
+  - model: unet2d
   - training: training
   - trainer: trainer
   - _self_

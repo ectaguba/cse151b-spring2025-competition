@@ -1,22 +1,3 @@
-# @package _global_.model
-type: temporal_cnn       # ← maps to TemporalCNNDepthwise
-
-# --- architecture hyper‑params ---
-hidden_channels: 128   # channels inside ConvLSTM / feature extractor
-depth: 2              # number of stacked ConvLSTM cells
-dropout_rate: 0.2
-pool_k: 2
-
-# (Nothing to set for kernel_size etc.; TemporalCNN fixes its own 3×3 convs.)
-
-
-# 10 GB:
-# hidden_channels: 64        
-# depth: 4                    
-# dropout_rate: 0.2
-# pool_k: 2
-# window_length: 36
-
-
-# right now: depth 2, hidden 256, window 24 => 9 GB
-# A5000: depth 3, hidden 256, window 24 => 12 GB
+type: unet2d
+base_features: 128
+depth: 4
